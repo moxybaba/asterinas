@@ -22,7 +22,7 @@ use crate::{
         file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, mkmod},
         pipe::Pipe,
         pseudofs::AnonDeviceId,
-        tmpfs::{TMPFS_MAGIC, TmpFsOptions},
+        tmpfs::{TMPFS_MAGIC, TmpFsOptions, TmpFsQuota},
         utils::{CStr256, DirentVisitor},
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
@@ -54,6 +54,8 @@ pub(crate) struct RamFs {
     inode_allocator: AtomicU64,
     /// FS event subscriber stats for this file system
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Resource accounting, which only tmpfs has
+    quota: Option<Arc<TmpFsQuota>>,
 }
 
 impl RamFs {
@@ -94,6 +96,7 @@ impl RamFs {
             InodeMode::from_bits_truncate(options.mode),
             Uid::new(options.uid),
             Gid::new(options.gid),
+            Some(Arc::new(TmpFsQuota::new(options.max_blocks))),
         )
     }
 
@@ -107,6 +110,7 @@ impl RamFs {
             mkmod!(a+rx, u+w),
             Uid::new_root(),
             Gid::new_root(),
+            None,
         )
     }
 
@@ -117,6 +121,7 @@ impl RamFs {
         root_mode: InodeMode,
         root_uid: Uid,
         root_gid: Gid,
+        quota: Option<Arc<TmpFsQuota>>,
     ) -> Arc<Self> {
         let root_dev_id = anon_device_id.id();
         Arc::new_cyclic(move |weak_fs| Self {
@@ -137,6 +142,7 @@ impl RamFs {
             }),
             inode_allocator: AtomicU64::new(ROOT_INO + 1),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            quota,
         })
     }
 
@@ -160,7 +166,15 @@ impl FileSystem for RamFs {
     }
 
     fn sb(&self) -> SuperBlock {
-        self.sb.clone()
+        let mut sb = self.sb.clone();
+        if let Some(quota) = &self.quota
+            && sb.blocks != 0
+        {
+            let free_blocks = sb.blocks.saturating_sub(quota.used_blocks());
+            sb.bfree = free_blocks;
+            sb.bavail = free_blocks;
+        }
+        sb
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
@@ -212,8 +226,12 @@ impl Inner {
         Self::Dir(RwLock::new(DirEntry::new(this, parent)))
     }
 
-    pub(self) fn new_file() -> Self {
-        Self::File(Mutex::new(PageCache::new_anon(0).unwrap()))
+    pub(self) fn new_file(quota: Option<&Arc<TmpFsQuota>>) -> Self {
+        let page_cache = match quota {
+            Some(quota) => PageCache::new_anon_with_charger(0, quota.clone()).unwrap(),
+            None => PageCache::new_anon(0).unwrap(),
+        };
+        Self::File(Mutex::new(page_cache))
     }
 
     pub(self) fn new_symlink() -> Self {
@@ -558,7 +576,7 @@ impl RamInode {
 
     fn new_file(fs: &Arc<RamFs>, mode: InodeMode, uid: Uid, gid: Gid) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
-            inner: Inner::new_file(),
+            inner: Inner::new_file(fs.quota.as_ref()),
             metadata: SpinLock::new(InodeMeta::new(mode, uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,
@@ -579,7 +597,7 @@ impl RamInode {
         hard_linkability: HardLinkability,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| RamInode {
-            inner: Inner::new_file(),
+            inner: Inner::new_file(fs.quota.as_ref()),
             metadata: SpinLock::new(InodeMeta::new_tmpfile(mode, uid, gid)),
             ino: fs.alloc_id(),
             typ: InodeType::File,
@@ -766,9 +784,25 @@ impl FileOps for RamInode {
                 if should_expand_size {
                     page_cache.resize(new_size_aligned, file_size)?;
                 }
-                page_cache.write(offset, reader)?;
 
-                write_len
+                // Write through the VMO directly, so that errors such as `ENOSPC`
+                // are not converted to coarser errors, and so that a write that
+                // fails halfway can report the bytes that have been copied.
+                let result = page_cache.as_vmo().write(offset, reader);
+                let written_len = write_len - reader.remain();
+
+                if written_len < write_len && should_expand_size {
+                    // Do not expose the part of the file that has not been written.
+                    let final_size = file_size.max(offset + written_len);
+                    let mut inode_meta = self.metadata.lock();
+                    inode_meta.size = final_size;
+                    inode_meta.blocks = final_size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
+                }
+
+                match result {
+                    Err(err) if written_len == 0 => return Err(err),
+                    _ => written_len,
+                }
             }
             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
         };

@@ -5,9 +5,11 @@
 pub(super) use fs::TmpFs;
 use fs::TmpFsType;
 pub(super) use options::TmpFsOptions;
+pub(super) use quota::TmpFsQuota;
 
 mod fs;
 mod options;
+mod quota;
 
 pub(super) const TMPFS_MAGIC: u64 = 0x0102_1994;
 
