@@ -96,7 +96,7 @@ impl RamFs {
             InodeMode::from_bits_truncate(options.mode),
             Uid::new(options.uid),
             Gid::new(options.gid),
-            Some(Arc::new(TmpFsQuota::new(options.max_blocks))),
+            Some(Arc::new(TmpFsQuota::new(options.max_blocks, options.max_inodes))),
         )
     }
 
@@ -149,6 +149,20 @@ impl RamFs {
     fn alloc_id(&self) -> u64 {
         self.inode_allocator.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Charges an inode to the quota of this file system, if it has one.
+    fn try_charge_inode(&self) -> Result<()> {
+        match &self.quota {
+            Some(quota) => quota.try_charge_inode(),
+            None => Ok(()),
+        }
+    }
+
+    fn uncharge_inode(&self) {
+        if let Some(quota) = &self.quota {
+            quota.uncharge_inode();
+        }
+    }
 }
 
 impl FileSystem for RamFs {
@@ -174,11 +188,29 @@ impl FileSystem for RamFs {
             sb.bfree = free_blocks;
             sb.bavail = free_blocks;
         }
+        if let Some(quota) = &self.quota
+            && sb.files != 0
+        {
+            sb.ffree = sb.files.saturating_sub(quota.used_inodes());
+        }
         sb
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+}
+
+impl Drop for RamInode {
+    fn drop(&mut self) {
+        // The root inode is never uncharged. Inodes detached from any file
+        // system, such as those of `memfd`, have no file system to uncharge.
+        if self.ino == ROOT_INO {
+            return;
+        }
+        if let Some(fs) = self.fs.upgrade() {
+            fs.uncharge_inode();
+        }
     }
 }
 
@@ -947,22 +979,15 @@ impl Inode for RamInode {
             return_errno_with_message!(Errno::EEXIST, "entry exists");
         }
 
+        let fs = self.fs.upgrade().unwrap();
+        fs.try_charge_inode()?;
         let (uid, gid) = current_fs_ids();
         let new_inode = match type_ {
             MknodType::CharDevice(dev_id) | MknodType::BlockDevice(dev_id) => {
                 let dev_type = type_.device_type().unwrap();
-                RamInode::new_device(
-                    &self.fs.upgrade().unwrap(),
-                    mode,
-                    uid,
-                    gid,
-                    dev_type,
-                    dev_id,
-                )
+                RamInode::new_device(&fs, mode, uid, gid, dev_type, dev_id)
             }
-            MknodType::NamedPipe => {
-                RamInode::new_named_pipe(&self.fs.upgrade().unwrap(), mode, uid, gid)
-            }
+            MknodType::NamedPipe => RamInode::new_named_pipe(&fs, mode, uid, gid),
         };
 
         let mut self_dir = self_dir.upgrade();
@@ -995,6 +1020,7 @@ impl Inode for RamInode {
         }
 
         let fs = self.fs.upgrade().unwrap();
+        fs.try_charge_inode()?;
         let (uid, gid) = current_fs_ids();
         let new_inode = match type_ {
             InodeType::File => RamInode::new_file(&fs, mode, uid, gid),
@@ -1032,6 +1058,7 @@ impl Inode for RamInode {
         }
 
         let fs = self.fs.upgrade().unwrap();
+        fs.try_charge_inode()?;
         let (uid, gid) = current_fs_ids();
         Ok(RamInode::new_tmpfile(&fs, mode, uid, gid, hard_linkability))
     }
