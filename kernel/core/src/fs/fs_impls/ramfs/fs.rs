@@ -22,7 +22,7 @@ use crate::{
         file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, mkmod},
         pipe::Pipe,
         pseudofs::AnonDeviceId,
-        tmpfs::{self, TMPFS_MAGIC},
+        tmpfs::{TMPFS_MAGIC, TmpFsOptions},
         utils::{CStr256, DirentVisitor},
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
@@ -68,12 +68,18 @@ impl RamFs {
     // TODO: Remove this tmpfs-specific constructor once `TmpFs` no longer
     // aliases `RamFs`.
     pub(crate) fn new_tmpfs() -> Arc<Self> {
+        Self::new_tmpfs_with_options(&TmpFsOptions::default())
+    }
+
+    pub(in crate::fs) fn new_tmpfs_with_options(options: &TmpFsOptions) -> Arc<Self> {
         let anon_device_id = AnonDeviceId::acquire().expect("no device ID is available for tmpfs");
         let sb = {
             let mut super_block =
                 SuperBlock::new(TMPFS_MAGIC, BLOCK_SIZE, NAME_MAX, anon_device_id.id());
-            let max_blocks = tmpfs::default_max_blocks();
-            let max_inodes = tmpfs::default_max_inodes();
+            // Like Linux, a tmpfs without a limit reports zero blocks and inodes.
+            // TODO: Report the free blocks and inodes once tmpfs tracks its usage.
+            let max_blocks = options.max_blocks.unwrap_or(0);
+            let max_inodes = options.max_inodes.unwrap_or(0);
             super_block.blocks = max_blocks;
             super_block.bfree = max_blocks;
             super_block.bavail = max_blocks;
@@ -81,19 +87,36 @@ impl RamFs {
             super_block.ffree = max_inodes;
             super_block
         };
-        Self::new_internal_with_sb("tmpfs", anon_device_id, sb)
+        Self::new_internal_with_sb(
+            "tmpfs",
+            anon_device_id,
+            sb,
+            InodeMode::from_bits_truncate(options.mode),
+            Uid::new(options.uid),
+            Gid::new(options.gid),
+        )
     }
 
     fn new_internal(name: &'static str) -> Arc<Self> {
         let anon_device_id = AnonDeviceId::acquire().expect("no device ID is available for ramfs");
         let sb = SuperBlock::new(RAMFS_MAGIC, BLOCK_SIZE, NAME_MAX, anon_device_id.id());
-        Self::new_internal_with_sb(name, anon_device_id, sb)
+        Self::new_internal_with_sb(
+            name,
+            anon_device_id,
+            sb,
+            mkmod!(a+rx, u+w),
+            Uid::new_root(),
+            Gid::new_root(),
+        )
     }
 
     fn new_internal_with_sb(
         name: &'static str,
         anon_device_id: AnonDeviceId,
         sb: SuperBlock,
+        root_mode: InodeMode,
+        root_uid: Uid,
+        root_gid: Gid,
     ) -> Arc<Self> {
         let root_dev_id = anon_device_id.id();
         Arc::new_cyclic(move |weak_fs| Self {
@@ -102,11 +125,7 @@ impl RamFs {
             sb,
             root: Arc::new_cyclic(|weak_root| RamInode {
                 inner: Inner::new_dir(weak_root.clone(), weak_root.clone()),
-                metadata: SpinLock::new(InodeMeta::new_dir(
-                    mkmod!(a+rx, u+w),
-                    Uid::new_root(),
-                    Gid::new_root(),
-                )),
+                metadata: SpinLock::new(InodeMeta::new_dir(root_mode, root_uid, root_gid)),
                 ino: ROOT_INO,
                 typ: InodeType::Dir,
                 this: weak_root.clone(),

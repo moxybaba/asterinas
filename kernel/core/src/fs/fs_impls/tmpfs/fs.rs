@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use super::options::TmpFsOptions;
 use crate::{
     fs::{
         ramfs::RamFs,
@@ -42,8 +43,9 @@ impl FsType for TmpFsType {
         FsProperties::empty()
     }
 
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(TmpFs::new_tmpfs())
+    fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
+        let options = TmpFsOptions::parse(fs_creation_ctx.args())?;
+        Ok(TmpFs::new_tmpfs_with_options(&options))
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
