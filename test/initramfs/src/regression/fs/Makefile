@@ -15,6 +15,7 @@ SUBDIRS := \
 	symlink \
 	sync \
 	tmpfile \
+	tmpfs \
 	utimensat \
 
 include ../common/Makefile
