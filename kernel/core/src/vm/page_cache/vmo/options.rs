@@ -8,7 +8,7 @@ use align_ext::AlignExt;
 use ostd::mm::{FrameAllocOptions, Segment};
 use xarray::XArray;
 
-use super::{Vmo, VmoFlags, WritableMappingStatus};
+use super::{PageCharger, Vmo, VmoFlags, WritableMappingStatus};
 use crate::{
     prelude::*,
     vm::{
@@ -44,6 +44,7 @@ pub(crate) struct VmoOptions {
     size: usize,
     flags: VmoFlags,
     backend: Option<Weak<dyn PageCacheBackend>>,
+    charger: Option<Arc<dyn PageCharger>>,
 }
 
 impl VmoOptions {
@@ -60,6 +61,7 @@ impl VmoOptions {
             size,
             flags: VmoFlags::empty(),
             backend: None,
+            charger: None,
         }
     }
 
@@ -88,6 +90,13 @@ impl VmoOptions {
         self.backend = Some(backend);
         self
     }
+
+    /// Sets the charger that accounts for the pages committed to an anonymous VMO.
+    pub(crate) fn charger(mut self, charger: Arc<dyn PageCharger>) -> Self {
+        debug_assert!(self.backend.is_none());
+        self.charger = Some(charger);
+        self
+    }
 }
 
 impl VmoOptions {
@@ -97,9 +106,9 @@ impl VmoOptions {
             size,
             flags,
             backend,
-            ..
+            charger,
         } = self;
-        let vmo = alloc_vmo(size, flags, backend)?;
+        let vmo = alloc_vmo(size, flags, backend, charger)?;
         Ok(Arc::new(vmo))
     }
 }
@@ -108,6 +117,7 @@ fn alloc_vmo(
     size: usize,
     flags: VmoFlags,
     backend: Option<Weak<dyn PageCacheBackend>>,
+    charger: Option<Arc<dyn PageCharger>>,
 ) -> Result<Vmo> {
     let size = size.align_up(PAGE_SIZE);
     let pages = committed_pages_if_continuous(flags, size)?;
@@ -120,6 +130,8 @@ fn alloc_vmo(
         size: AtomicUsize::new(size),
         writable_mapping_status,
         rmap: Mutex::new(rmap),
+        charger,
+        charged_pages: AtomicUsize::new(0),
     })
 }
 

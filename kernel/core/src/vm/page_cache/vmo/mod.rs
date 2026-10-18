@@ -139,6 +139,18 @@ pub(crate) struct Vmo {
     pub(super) writable_mapping_status: WritableMappingStatus,
     /// Reserve mappings.
     pub(super) rmap: Mutex<Rmap>,
+    /// Accounts for the pages committed to this anonymous VMO, if any.
+    pub(super) charger: Option<Arc<dyn PageCharger>>,
+    /// The number of pages that are currently charged to `charger`.
+    pub(super) charged_pages: AtomicUsize,
+}
+
+impl Drop for Vmo {
+    fn drop(&mut self) {
+        if let Some(charger) = &self.charger {
+            charger.uncharge(self.charged_pages.load(Ordering::Relaxed));
+        }
+    }
 }
 
 impl Debug for Vmo {
@@ -150,6 +162,19 @@ impl Debug for Vmo {
             .field("writable_mapping_status", &self.writable_mapping_status)
             .finish_non_exhaustive()
     }
+}
+
+/// A hook that lets a file system account for the pages committed to an
+/// anonymous VMO, for example to enforce a size limit.
+///
+/// Implementations are called while the page array of the VMO is locked, so
+/// they must not sleep.
+pub(crate) trait PageCharger: Send + Sync {
+    /// Charges `nr_pages` pages, failing with `ENOSPC` if the limit is exceeded.
+    fn try_charge(&self, nr_pages: usize) -> Result<()>;
+
+    /// Uncharges `nr_pages` pages that have been charged before.
+    fn uncharge(&self, nr_pages: usize);
 }
 
 bitflags! {
@@ -317,7 +342,21 @@ impl Vmo {
             return Ok(page.clone());
         }
 
-        let new_page = CachePage::alloc_zero()?;
+        if let Some(charger) = &self.charger {
+            charger.try_charge(1)?;
+        }
+        let new_page = match CachePage::alloc_zero() {
+            Ok(page) => page,
+            Err(err) => {
+                if let Some(charger) = &self.charger {
+                    charger.uncharge(1);
+                }
+                return Err(err);
+            }
+        };
+        if self.charger.is_some() {
+            self.charged_pages.fetch_add(1, Ordering::Relaxed);
+        }
         cursor.store(new_page.clone());
         Ok(new_page)
     }
@@ -493,8 +532,11 @@ impl Vmo {
         // We remove pages before unmapping them in the page table. So a concurrent page fault will
         // synchronize via the page table lock. Either the mapped item will be unmapped below or the
         // page fault handler will commit the page and be blocked on the reverse-mapping lock.
+        let mut removed_pages = 0;
         loop {
-            cursor.remove();
+            if cursor.remove().is_some() {
+                removed_pages += 1;
+            }
             let page_idx = cursor.next_present();
             if page_idx.is_none_or(|idx| idx >= page_idx_range.end as u64) {
                 break;
@@ -504,6 +546,12 @@ impl Vmo {
         drop(locked_pages);
 
         locked_rmap.unmap(page_idx_range.start * PAGE_SIZE..page_idx_range.end * PAGE_SIZE);
+
+        if let Some(charger) = &self.charger {
+            self.charged_pages
+                .fetch_sub(removed_pages, Ordering::Relaxed);
+            charger.uncharge(removed_pages);
+        }
 
         Ok(())
     }
@@ -792,7 +840,15 @@ impl Vmo {
             match self.try_operate_on_range_internal(&current_range, &mut operate, commit_mode) {
                 Ok(()) => break 'retry,
                 Err(err) => {
-                    let (idx, page) = self.handle_commit_error(err, commit_mode)?;
+                    // If some pages have already been collected, return them
+                    // first so that the caller can make partial progress. The
+                    // same error is reported by the next call, which starts
+                    // from the page that failed.
+                    let (idx, page) = match self.handle_commit_error(err, commit_mode) {
+                        Ok(res) => res,
+                        Err(_) if !pages.is_empty() => break 'retry,
+                        Err(err) => return Err(err),
+                    };
                     pages.push((idx, page));
                     current_range.start = (idx + 1) * PAGE_SIZE;
                     if current_range.start >= range.end {

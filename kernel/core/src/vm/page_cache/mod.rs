@@ -121,7 +121,7 @@ mod tests;
 mod vmo;
 
 pub(crate) use cache_page::{CachePage, CachePageExt, CachePageMeta, LockedCachePage};
-pub(crate) use vmo::{Vmo, VmoCommitError, VmoFlags, VmoMapMode, VmoOptions};
+pub(crate) use vmo::{PageCharger, Vmo, VmoCommitError, VmoFlags, VmoMapMode, VmoOptions};
 
 /// The page cache for a file-like object.
 ///
@@ -171,6 +171,15 @@ impl PageCache {
     /// bytes.
     pub(crate) fn new_anon(size: usize) -> Result<Self> {
         Ok(Self(VmoOptions::new_anon(size).alloc()?))
+    }
+
+    /// Creates an anonymous page cache whose committed pages are accounted by
+    /// `charger`.
+    pub(crate) fn new_anon_with_charger(
+        size: usize,
+        charger: Arc<dyn PageCharger>,
+    ) -> Result<Self> {
+        Ok(Self(VmoOptions::new_anon(size).charger(charger).alloc()?))
     }
 
     /// Returns the wrapped [`Vmo`].
